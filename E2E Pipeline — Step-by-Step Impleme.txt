@@ -1,0 +1,378 @@
+E2E Pipeline — Step-by-Step Implementation Guide
+Phase 1: Infrastructure Setup (AWS CDK)
+All resources follow 
+Resource Naming Conventions and Best Practices
+.
+
+Step 1.1 — Create the CDK Stack
+
+
+// bin/product-hierarchy-app.ts
+const app = new cdk.App();
+const envName = app.node.tryGetContext('env') || 'dev';
+new ProductHierarchyStack(app, `product-hierarchy-to-pmm-${envName}-stack`, {
+  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: 'eu-west-1' },
+  environmentName: envName,
+});
+Apply standard tags:
+
+
+
+cdk.Tags.of(this).add('Organization', 'Wickes');
+cdk.Tags.of(this).add('System', 'product-hierarchy-to-pmm');
+cdk.Tags.of(this).add('Environment', props.environmentName);
+cdk.Tags.of(this).add('ProductFamily', 'etl');
+cdk.Tags.of(this).add('Automation:ManagedBy', 'CDK');
+Step 1.2 — Create S3 Bucket
+Name: wickes-<accountId>-eu-west-1-product-hierarchy-to-pmm-<env>-bucket
+
+
+
+const bucket = new s3.Bucket(this, 'product-hierarchy-to-pmm-bucket', {
+  bucketName: `wickes-${this.account}-eu-west-1-product-hierarchy-to-pmm-${props.environmentName}-bucket`,
+  removalPolicy: cdk.RemovalPolicy.RETAIN,
+  lifecycleRules: [
+    { expiration: cdk.Duration.days(180), prefix: 'inbound/' },
+    { expiration: cdk.Duration.days(180), prefix: 'archived/' },
+    { expiration: cdk.Duration.days(180), prefix: 'errored/' },
+    { expiration: cdk.Duration.days(180), prefix: 'reports/' },
+  ],
+});
+Folder structure:
+
+
+
+├── inbound/    ← files uploaded from Google Drive
+├── archived/   ← successfully processed files
+├── errored/    ← validation-failed files
+└── reports/    ← generated error/success reports
+Step 1.3 — Create DynamoDB Table
+Name: product-hierarchy-to-pmm-<env>-table
+
+
+
+const table = new dynamodb.Table(this, 'product-hierarchy-to-pmm-table', {
+  tableName: `product-hierarchy-to-pmm-${props.environmentName}-table`,
+  partitionKey: { name: 'PK', type: dynamodb.AttributeType.STRING },
+  sortKey: { name: 'batchNo', type: dynamodb.AttributeType.NUMBER },
+  billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+  timeToLiveAttribute: 'ttl',
+});
+Step 1.4 — Create Parameter Store Entries
+
+
+// /sdiupload/product-hierarchy/users → comma-separated authorised emails
+// /sdiupload/product-hierarchy/folderIds → JSON with inboundFolderId & reportFolderId
+Step 1.5 — Create Secrets Manager Entries
+Following convention applications/<product>/<env>/<destination>/<auth-type>:
+
+applications/product-hierarchy/<env>/google-drive/service-account-credentials
+
+applications/product-hierarchy/<env>/pmm-uniprod/db-credentials
+
+Step 1.6 — Create Initiator Lambda
+Name: product-hierarchy-to-pmm-<env>-initiator | Timeout: 5 min | Memory: 512 MB
+
+
+
+const initiatorLambda = new lambda.Function(this, 'InitiatorLambda', {
+  functionName: `product-hierarchy-to-pmm-${props.environmentName}-initiator`,
+  runtime: lambda.Runtime.NODEJS_20_X,
+  handler: 'index.handler',
+  timeout: cdk.Duration.minutes(5),
+  memorySize: 512,
+  // env vars: BUCKET_NAME, GOOGLE_DRIVE_FOLDER_IDS_PARAM, AUTHORISED_USERS_PARAM, GOOGLE_SECRET_NAME
+});
+bucket.grantPut(initiatorLambda);
+Step 1.7 — Create Processor Lambda
+Name: product-hierarchy-to-pmm-<env>-processor | Timeout: 15 min | Memory: 1024 MB | Concurrency: 1
+
+
+
+const processorLambda = new lambda.Function(this, 'ProcessorLambda', {
+  functionName: `product-hierarchy-to-pmm-${props.environmentName}-processor`,
+  reservedConcurrentExecutions: 1, // CRITICAL: prevent race conditions
+  timeout: cdk.Duration.minutes(15),
+  memorySize: 1024,
+  // env vars: TABLE_NAME, BUCKET_NAME, PMM_SECRET_NAME, GOOGLE_SECRET_NAME, GOOGLE_DRIVE_FOLDER_IDS_PARAM
+});
+bucket.grantReadWrite(processorLambda);
+table.grantReadWriteData(processorLambda);
+// S3 event notification
+bucket.addEventNotification(s3.EventType.OBJECT_CREATED, new s3n.LambdaDestination(processorLambda), { prefix: 'inbound/' });
+Step 1.8 — Create EventBridge Scheduler
+
+
+// Cron schedule: daily at time TBC with business
+new scheduler.CfnSchedule(this, 'DailyScheduler', {
+  name: `product-hierarchy-to-pmm-${props.environmentName}-scheduler`,
+  scheduleExpression: 'cron(0 6 * * ? *)', // TBC
+  target: { arn: initiatorLambda.functionArn, roleArn: schedulerRole.roleArn },
+});
+Phase 2: Initiator Lambda — Business Logic
+Trigger: EventBridge Scheduler (daily)
+
+Step
+
+Action
+
+Details
+
+2.1
+
+Authenticate with Google Drive
+
+Fetch service account creds from Secrets Manager → initialise google.auth.GoogleAuth with drive scope
+
+2.2
+
+List files from /inbound folder
+
+drive.files.list() with trashed=false, ordered by createdTime asc (oldest first)
+
+2.3
+
+Filter by authorised users
+
+Fetch /sdiupload/product-hierarchy/users from SSM → check each file's owners[0].emailAddress against the list. Log PMM_PRODUCT_UPLOAD_01 for unauthorised files
+
+2.4
+
+Upload authorised files to S3
+
+Download each file via drive.files.get(alt: 'media') → upload to s3://bucket/inbound/{fileName} with metadata (uploadedBy, originalFileId)
+
+2.5
+
+Delete ALL files from Google Drive
+
+Delete both authorised and unauthorised files from the inbound folder to clean up
+
+Phase 3: Processor Lambda — Business Logic
+Trigger: S3 event notification (file lands in /inbound)
+
+Step
+
+Action
+
+Details
+
+3.1
+
+Receive S3 event & fetch file
+
+Parse event for bucket/key → GetObjectCommand to fetch file content and metadata
+
+3.2
+
+Get latest batch number
+
+QueryCommand on DynamoDB: PK = 'BATCH', ScanIndexForward: false, Limit: 1 → increment by 1 → PutCommand new record with status PROCESSING and TTL (6 months)
+
+3.3
+
+Parse & validate CSV
+
+Parse file using csv-parse → validate every row against the https://docs.google.com/spreadsheets/d/1dqbKDZcR71M-SGyHXAns3gxLEI9AZe1rM4leCS9_uaQ/editConnect your Google account (required fields, data types, tran_type values, level rules)
+
+3.4
+
+If validation fails
+
+Move file to /errored → generate report CSV (input + errorReason column) → upload to S3 /reports AND Google Drive /reports → update DynamoDB status to FAILED → STOP
+
+3.5
+
+Connect to PMM Uniprod DB
+
+Fetch DB creds from Secrets Manager → oracledb.getConnection()
+
+3.6
+
+Insert records into SDIPRDMSI
+
+Loop through each CSV row in order → INSERT INTO UNIPROD.SDIPRDMSI (batch_num, prd_lvl_number, prd_lvl_id, tran_type, prd_lvl_parent, prd_name_full, prd_style_ind, prd_status) VALUES (...) → commit
+
+3.7
+
+Execute SDIPRDBA procedure
+
+BEGIN SDIPRDBA; END; — wait for completion (expected < 5 min)
+
+3.8
+
+Fetch failed records
+
+SELECT batch_num, prd_lvl_number, prd_lvl_id, prd_lvl_parent, prd_name_full, error_code FROM UNIPROD.SDIPRDMSI WHERE batch_num = ? — successful records are auto-deleted by the procedure
+
+3.9
+
+Generate report & archive
+
+Map error_code to descriptions (05→Product Number Invalid, 08→Invalid Transaction Type, 10→Changed Record Invalid Level, 39→Null Product Name, 50→Invalid Vendor Number, 134→Invalid Style Indicator, 138→Level Not Valid) → upload report to S3 + Google Drive → move file from /inbound to /archived → update DynamoDB status: SUCCESS if 0 failures, PARTIALLY_FAILED if some failures
+
+Phase 4: Retry Mechanism
+
+
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3, operationName: string, batchNo: number, errorCode: string): Promise<T> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try { return await fn(); }
+    catch (error) {
+      logger.warn({ errorCode, trackingId1: batchNo, message: `${operationName} attempt ${attempt}/${maxRetries} failed: ${error.message}` });
+      if (attempt < maxRetries) await sleep(Math.pow(2, attempt) * 1000); // exponential backoff
+    }
+  }
+  // Exhausted → move file to /errored, raise P3 Datadog alert
+  throw lastError;
+}
+Do NOT retry authorisation failures or data validation errors. After exhausting retries, move file to /errored — support can move it back to /inbound to trigger a new batch.
+
+Phase 5: Logging Standards
+Every log must include:
+
+
+
+{ "integrationStack": "aws", "interfaceId": "PMM-PRODUCT-UPLOAD", "sourceService": "GoogleDrive", "destinationService": "PMM", "trackingId1": "<BATCH_NO>", "trackingId2": "<PRD_LVL_PARENT>", "trackingId3": "<PRD_LVL_NUMBER>" }
+Refer to the Logging and Auditing section already on the page for the complete list of log points for both lambdas.
+
+Phase 6: Testing Strategy
+Type
+
+What to Test
+
+Unit
+
+CSV parsing/validation, batch number increment, error code mapping, retry logic with mocked failures
+
+Integration
+
+Google Drive API (list/download/delete), S3 operations, DynamoDB CRUD, Oracle DB connection + INSERT + procedure
+
+E2E — Happy path
+
+Valid file → full pipeline → status SUCCESS, no report
+
+E2E — Validation fail
+
+Invalid file → FAILED, report in GDrive + S3
+
+E2E — Partial fail
+
+Valid file, some PMM rejections → PARTIALLY_FAILED, report generated
+
+E2E — Unauthorised
+
+File from non-authorised user → skipped, logged as PMM_PRODUCT_UPLOAD_01
+
+E2E — Transient failure
+
+Simulate service outage → verify 3 retries → file moved to /errored
+
+Downstream
+
+Confirm records in PMM via Taxonomy/Product services, reports in GDrive, Datadog alerts fire
+
+Phase 7: Deployment Checklist
+#
+
+Task
+
+Status
+
+1
+
+CDK stack deployed to dev
+
+⬜
+
+2
+
+S3 bucket with lifecycle policies
+
+⬜
+
+3
+
+DynamoDB table with TTL
+
+⬜
+
+4
+
+Parameter Store entries configured
+
+⬜
+
+5
+
+Secrets Manager entries (Google + PMM)
+
+⬜
+
+6
+
+Initiator Lambda deployed & tested
+
+⬜
+
+7
+
+Processor Lambda deployed (concurrency=1)
+
+⬜
+
+8
+
+EventBridge Scheduler configured
+
+⬜
+
+9
+
+S3 → Lambda event notification
+
+⬜
+
+10
+
+Google Drive shared folder with access control
+
+⬜
+
+11
+
+PMM Uniprod DB user (min privileges: SDIPRDMSI read/write + SDIPRDBA execute)
+
+⬜
+
+12
+
+Datadog alerts for all error codes
+
+⬜
+
+13
+
+E2E test in dev
+
+⬜
+
+14
+
+Deploy & test in staging
+
+⬜
+
+15
+
+Deploy to production
+
+⬜
+
+This covers the entire pipeline from infrastructure provisioning through to production deployment. Each phase builds on the previous one, and the code snippets align with the patterns already used in your 
+Design Tools: Images Data Migration LLD
+ and the 
+Product Hierarchy upload
+.
+
+Would you like me to paste this directly into your page's "Proposed Design" section, or would you prefer to dive deeper into any specific phase — say the validation logic or the Oracle DB integration?

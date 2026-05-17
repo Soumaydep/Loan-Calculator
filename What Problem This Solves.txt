@@ -1,0 +1,296 @@
+What Problem This Solves
+Business users currently key product hierarchies into PMM manually via its UI. This is painful when there are hundreds of items (e.g., 700+ Paint-to-Order styles), and PMM's UI is slow/unresponsive. This pipeline automates bulk loading via CSV files dropped into a Google Drive folder.
+
+Functional Overview (The "What")
+Capability
+
+Description
+
+File submission
+
+Business users drop a CSV into a shared Google Drive /inbound folder
+
+Authentication
+
+Google Workspace manages who can access the Drive folder (only whitelisted users can add/view files)
+
+Validation
+
+Every row is validated against rules (data types, required fields, lengths) — if any single row fails, the entire file is rejected
+
+DB Load
+
+Valid rows are inserted into PMM's UNIPROD.SDIPRDMSI table
+
+PMM Processing
+
+The stored procedure SDIPRDBA is executed — this is PMM's native SDI bulk loader
+
+Reporting
+
+A CSV report is generated and uploaded back to Google Drive /reports folder for business users to review
+
+Logical Flow (The "How") — Build This Sequence
+Component 1: Initiator Lambda
+Trigger: EventBridge Scheduler (daily)
+
+
+
+START
+│
+├─ 1. Authenticate to Google Drive
+│     └─ Use Google Workspace service account credentials (from Secrets Manager)
+│
+├─ 2. List files in Google Drive /inbound folder
+│     └─ Filter: only files modified since last run, process oldest first
+│
+├─ 3. For each file:
+│     ├─ Get file metadata (uploader email, filename, modified date)
+│     ├─ Copy file to S3 bucket: s3://<bucket>/inbound/<filename>
+│     └─ Delete file from Google Drive (cleanup)
+│
+└─ END
+Key detail: The secondary user authorization check against SSM parameter (/sdiupload/product-hierarcy/users) was removed per the design — access control is handled entirely at the Google Drive folder level.
+
+Component 2: Processor Lambda
+Trigger: S3 event notification on inbound/ prefix
+Concurrency: Set to 1 (sequential processing, one file at a time)
+
+
+
+START
+│
+├─ 1. Fetch file from S3 /inbound
+│
+├─ 2. Create batch record
+│     ├─ Query DynamoDB (sdi-tracker table) for MAX(batch_num)
+│     ├─ New batch_num = MAX + 1
+│     └─ Write record: { batchNum, fileName, status: "PROCESSING", timestamp }
+│
+├─ 3. VALIDATE every row
+│     │  Rules (from mapping sheet):
+│     │  - Required fields not null
+│     │  - Data types correct
+│     │  - Field lengths within limits
+│     │  - Valid values (e.g., tran_type must be 'A', 'C', or NULL)
+│     │
+│     ├─ IF any row fails ──────────────────────────────┐
+│     │   ├─ Move file to S3 /errored                   │
+│     │   ├─ Generate error CSV (original + errorReason) │
+│     │   ├─ Upload report to S3 /reports               │
+│     │   ├─ Upload report to Google Drive /reports      │
+│     │   ├─ Update DynamoDB status → "FAILED"          │
+│     │   └─ STOP (reject entire file)                  │
+│     │                                                  │
+│     └─ IF all rows pass ─── continue ↓
+│
+├─ 4. INSERT rows into UNIPROD.SDIPRDMSI
+│     │  SQL pattern:
+│     │  INSERT INTO UNIPROD.SDIPRDMSI
+│     │    (batch_num, prd_lvl_number, prd_lvl_id, tran_type,
+│     │     prd_lvl_parent, prd_name_full, prd_style_ind, prd_status)
+│     │  VALUES (batch_num, ?, ?, ?, ?, ?, ?, ?);
+│     └─ Preserve row order from original CSV
+│
+├─ 5. EXECUTE stored procedure SDIPRDBA
+│     └─ Wait synchronously (expected <5 minutes)
+│
+├─ 6. CHECK for failures
+│     │  SELECT batch_num, prd_lvl_number, prd_lvl_id,
+│     │         prd_lvl_parent, prd_name_full, error_code
+│     │  FROM UNIPROD.SDIPRDMSI
+│     │  WHERE batch_num = <current_batch>;
+│     │
+│     │  (Successful rows are DELETED by SDIPRDBA,
+│     │   so remaining rows = failed rows)
+│     │
+│     ├─ Map error_code to human-readable messages (see error table below)
+│     └─ Generate report CSV
+│
+├─ 7. HOUSEKEEPING
+│     ├─ Move input file: S3 /inbound → /processed
+│     ├─ Upload report to S3 /reports
+│     ├─ Upload report to Google Drive /reports
+│     └─ Update DynamoDB:
+│          ├─ All rows passed → status: "SUCCESS"
+│          └─ Some rows failed → status: "PARTIALLY_FAILED"
+│
+└─ END
+What You Need to Build / Configure
+#
+
+Component
+
+Tech
+
+What to do
+
+1
+
+Google Drive shared folder
+
+Google Workspace
+
+Create folder with /inbound and /reports subfolders. Restrict access to authorized business users only
+
+2
+
+Initiator Lambda
+
+AWS Lambda (Python/Node)
+
+Authenticates to Google Drive, copies files to S3, cleans up Drive
+
+3
+
+S3 Bucket
+
+AWS S3
+
+Prefixes: inbound/, processed/, errored/, reports/. Set 6-month lifecycle policy
+
+4
+
+S3 Event Notification
+
+AWS S3 → Lambda
+
+Trigger Processor Lambda on ObjectCreated in inbound/
+
+5
+
+Processor Lambda
+
+AWS Lambda
+
+Validates, loads DB, runs procedure, generates reports. Reserved concurrency = 1
+
+6
+
+DynamoDB table
+
+AWS DynamoDB
+
+Table: sdi-tracker. Tracks batch numbers and status. 6-month TTL
+
+7
+
+EventBridge rule
+
+AWS EventBridge
+
+Daily cron trigger for the Initiator Lambda
+
+8
+
+Secrets Manager
+
+AWS Secrets Manager
+
+Store Google Drive service account credentials
+
+9
+
+DB connection
+
+Oracle (PMM UNIPROD)
+
+Create a dedicated DB user with minimum privileges: INSERT/SELECT/DELETE on SDIPRDMSI + EXECUTE on SDIPRDBA
+
+10
+
+Monitoring
+
+Datadog
+
+P3 alerts on exhausted retries for infra errors
+
+Error Codes You Need to Map
+These come back from PMM's SDIPRDBA procedure in the error_code column:
+
+Code
+
+Meaning
+
+What Failed
+
+05
+
+Product Number Invalid
+
+NULL, duplicate, exceeds max length, or doesn't exist for 'C'hange
+
+08
+
+Invalid Transaction Type
+
+tran_type not in ['A', 'C', NULL]
+
+10
+
+Changed Record Invalid Level
+
+Trying to 'C'hange a record not at level 1
+
+39
+
+Null Product Name
+
+prd_name_full is empty
+
+50
+
+Invalid Vendor Number
+
+NULL for level-1 products, or vendor not found in VPCMSTEE
+
+134
+
+Invalid Style Indicator
+
+Non-style product has dimension codes, or style change has no dimensions
+
+138
+
+Level Not Valid
+
+prd_lvl_id doesn't exist in PRDCTLEE table
+
+Retry & Error Strategy to Implement
+Error Type
+
+Action
+
+Validation failure (bad data)
+
+Reject whole file → move to errored/ → report to Drive → no retry
+
+Google Drive error
+
+Retry 3x → then raise Datadog P3 alert
+
+DynamoDB error
+
+Retry 3x → then raise Datadog P3 alert
+
+DB table/procedure error
+
+Retry 3x → then raise Datadog P3 alert
+
+Recovery from errored/
+
+Support manually fixes root cause, moves file back to inbound/ → triggers fresh processing
+
+Key Things to Watch Out For
+All-or-nothing validation — even 1 bad row rejects the entire file before any DB insert. This is intentional so the batch stays atomic.
+
+Partial success after DB load — the stored procedure can fail some rows. Those remain in the table for you to query and report.
+
+Concurrency = 1 — critical to avoid batch number collisions and race conditions in the SDIPRDMSI table.
+
+Preserve row order — insert rows in the same order as the CSV; PMM may depend on parent-before-child ordering.
+
+Google Drive reference pattern — there's an existing implementation you can follow: 
+Design Tools: Images Data Migration LLD | Google Drive.
+
+Mapping sheet — the exact field-to-column mapping and validation rules are in Connect your Google account. You'll need to implement your validator based on those rules.

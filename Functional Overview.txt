@@ -1,0 +1,95 @@
+Functional Overview
+What this system does: It automates the process of uploading product hierarchy data from Google Drive into the JDA PMM (Product Master Management) system's database (SDIPRDMSI table in the UNIPROD DB). Today this is likely a manual or semi-manual process — this design replaces it with a scheduled, event-driven pipeline.
+
+Who uses it: A business team uploads spreadsheet/CSV files containing product hierarchy data into a designated Google Drive folder. The system picks them up, validates them, loads them into PMM, and reports back with success/failure details.
+
+Logical Flow (Step-by-Step)
+The system has two main processing stages, each handled by a separate Lambda function:
+
+Stage 1 — Initiator Lambda (File Ingestion)
+Triggered daily by an EventBridge Scheduler.
+
+Authenticate with Google Drive using credentials from AWS Secrets Manager.
+
+List files in the Google Drive /inbound folder (only files modified since the last run).
+
+Authorize the uploader — check each file's owner against a whitelist stored in AWS Parameter Store (/sdiupload/product-hierarcy/users). If the uploader is not authorized, the file is skipped (but still deleted from Drive later).
+
+Upload authorized files to S3 — placed in the inbound/ prefix of the S3 bucket. Oldest file is uploaded first to preserve ordering.
+
+Clean up Google Drive — delete all files (including unauthorized ones) from the Drive /inbound folder.
+
+Key functional point: This Lambda is purely about moving files from Google Drive into S3. It does no data processing.
+
+Stage 2 — Processor Lambda (Validation & DB Load)
+Triggered automatically by an S3 event notification when a file lands in inbound/. Concurrency is set to 1 — meaning files are processed one at a time, sequentially.
+
+Fetch the file from S3.
+
+Create a batch record in DynamoDB — query the latest batch number, increment it, and write a new record with status PROCESSING.
+
+Validate every row in the file against predefined rules (referenced in a Google Sheet). If even one row fails validation:
+
+Move the file to errored/ in S3.
+
+Generate a report (same structure as input + an errorReason column).
+
+Upload the report to both S3 (reports/) and Google Drive (reports/).
+
+Update DynamoDB status to FAILED.
+
+Stop processing this file entirely — it's all-or-nothing at the validation stage.
+
+If validation passes, connect to the PMM UNIPROD database and insert each row into the SDIPRDMSI table, preserving the order from the original sheet.
+
+Execute the stored procedure SDIPRDBA — this is PMM's internal processing step. The Lambda waits for it to complete.
+
+Check for failures — after the procedure runs, any rows that failed will remain in SDIPRDMSI (successful rows are deleted by the procedure). Fetch these failed rows.
+
+Generate a report mapping error codes to human-readable validation rules.
+
+Final housekeeping:
+
+Move the input file from inbound/ to processed/ (archived) in S3.
+
+Upload the report to Google Drive and S3.
+
+Update DynamoDB status to SUCCESS (all rows passed) or PARTIALLY_FAILED (some rows failed in the procedure).
+
+Key Design Decisions
+Aspect
+
+Decision
+
+Processing model
+
+Sequential, one file at a time (Lambda concurrency = 1)
+
+Validation strictness
+
+All-or-nothing — one bad row fails the entire file before DB load
+
+Post-DB-load failures
+
+Partial success allowed — status becomes PARTIALLY_FAILED
+
+Retry policy
+
+3 retries for infrastructure errors (Google, S3, DynamoDB, DB). No retry for auth or validation errors
+
+Recovery
+
+Failed files go to errored/ — support moves them back to inbound/ after fixing the root cause, triggering a fresh batch
+
+Data retention
+
+S3 files and DynamoDB records have a 6-month TTL
+
+Observability
+
+Structured logging with metadata (interfaceId, batchNo, source/destination) and Datadog P3 alerts on exhausted retries
+
+Error Handling Summary
+The document defines 7 error codes (PMM_PRODUCT_UPLOAD_01 through _07) covering: unauthorized access, validation failure, Google Drive errors, DynamoDB errors, DB table errors, stored procedure errors, and unknown errors. All infrastructure errors follow the same pattern: retry 3 times → raise P3 Datadog alert → move file to errored/.
+
+In short: Business uploads a file → system picks it up on schedule → validates it strictly → loads it into PMM's database → runs a stored procedure → reports back on successes and failures. The two-Lambda design cleanly separates file ingestion from data processing, and the DynamoDB batch tracking provides full auditability.
